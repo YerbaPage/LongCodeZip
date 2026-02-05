@@ -220,21 +220,8 @@ class LongCodeZip:
         logger.debug("Initializing Entropy chunking...")
         self.entropy_chunking = EntropyChunking()
         
-        # Add caching system for model outputs and token information
-        self.cache = {
-            "token_length": {},      # Cache for token length by text
-            "encodings": {},         # Cache for tokenizer encodings
-            "perplexity": {},        # Cache for perplexity calculations
-            "conditional_ppl": {},   # Cache for conditional perplexity
-            "context_rankings": {},  # Cache for context rankings
-        }
-        self.max_cache_size = 1000   # Limit cache size to prevent memory issues
-        
-        # set up the max position embeddings and cache bos num
+        # set up the max position embeddings
         self.max_position_embeddings = getattr(self.model.config, "max_position_embeddings", 4096)
-        self.cache_bos_num = 10
-        self.prefix_bos_num = 100
-        self.context_idxs = []
     
     def load_model(
         self, model_name: str, device_map: str = "cuda", model_config: dict = {}
@@ -261,20 +248,6 @@ class LongCodeZip:
         self.tokenizer.padding_side = "left"
         logger.debug("Model and tokenizer loaded successfully")
         
-    def _manage_cache_size(self, cache_type):
-        """
-        Manage cache size by removing oldest entries when cache exceeds max size.
-        
-        Args:
-            cache_type: The type of cache to manage
-        """
-        if len(self.cache[cache_type]) > self.max_cache_size:
-            # Remove 20% of the oldest entries
-            remove_count = int(self.max_cache_size * 0.2)
-            keys_to_remove = list(self.cache[cache_type].keys())[:remove_count]
-            for key in keys_to_remove:
-                del self.cache[cache_type][key]
-        
     def get_token_length(
         self,
         text: str,
@@ -282,29 +255,15 @@ class LongCodeZip:
     ):
         """
         Get the number of tokens in the given text.
-        
+
         Args:
             text: The text to tokenize
             add_special_tokens: Whether to count special tokens
-            
+
         Returns:
             The number of tokens
         """
-        # Create a cache key based on text and parameters
-        cache_key = f"{text}_{add_special_tokens}"
-        
-        # Check if result is in cache
-        if cache_key in self.cache["token_length"]:
-            return self.cache["token_length"][cache_key]
-        
-        # Calculate token length if not in cache
-        token_length = len(self.tokenizer.encode(text, add_special_tokens=add_special_tokens))
-        
-        # Store in cache
-        self.cache["token_length"][cache_key] = token_length
-        self._manage_cache_size("token_length")
-        
-        return token_length
+        return len(self.tokenizer.encode(text, add_special_tokens=add_special_tokens))
     
     def get_ppl(
         self,
@@ -320,7 +279,7 @@ class LongCodeZip:
     ):
         """
         Calculate perplexity for the given text at line level.
-        
+
         Args:
             text: The text to calculate perplexity for
             granularity: The granularity of perplexity calculation (line, token, chunk)
@@ -329,47 +288,29 @@ class LongCodeZip:
             end: End position for calculation
             condition_mode: Mode for conditional perplexity (none, prefix)
             condition_pos_id: Position ID for condition
-            
+
         Returns:
             A dictionary with perplexity scores and processing information
         """
-        # Create a cache key for this specific perplexity calculation
-        cache_key = f"{text}_{granularity}_{condition_mode}_{condition_pos_id}"
-        if past_key_values is None and not return_kv and cache_key in self.cache["perplexity"]:
-            return self.cache["perplexity"][cache_key]
-        
         # Initialize input processing
         if input_ids is None:
-            encoding_key = text
-            if encoding_key in self.cache["encodings"]:
-                cached_encoding = self.cache["encodings"][encoding_key]
-                input_ids = cached_encoding["input_ids"]
-                attention_mask = cached_encoding["attention_mask"]
-            else:
-                encoding = self.tokenizer(
-                    text, 
-                    return_tensors="pt", 
-                    padding=True
-                )
-                input_ids = encoding["input_ids"].to(self.model.device)
-                attention_mask = encoding["attention_mask"].to(self.model.device)
-                
-                # Cache the encoding
-                self.cache["encodings"][encoding_key] = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask
-                }
-                self._manage_cache_size("encodings")
-        
+            encoding = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True
+            )
+            input_ids = encoding["input_ids"].to(self.model.device)
+            attention_mask = encoding["attention_mask"].to(self.model.device)
+
         if past_key_values is not None:
             past_length = past_key_values[0][0].shape[2]
         else:
             past_length = 0
-            
+
         if end is None:
             end = input_ids.shape[1]
         end = min(end, past_length + self.max_position_embeddings)
-        
+
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids[:, past_length:end],
@@ -379,31 +320,31 @@ class LongCodeZip:
                 output_hidden_states=True,
                 use_cache=True,
             )
-        
+
         # Get logits and shift
         shift_logits = outputs.logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., past_length+1:end].contiguous()
-        
+
         # Flatten tokens for loss calculation
         active = (attention_mask[:, past_length:end] == 1)[..., :-1].view(-1)
         active_logits = shift_logits.view(-1, shift_logits.size(-1))[active]
         active_labels = shift_labels.view(-1)[active]
-        
+
         # Calculate loss
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
         loss = loss_fct(active_logits, active_labels)
-        
+
         # Apply condition filtering if required
         if condition_mode == "prefix":
             loss = loss[condition_pos_id:]
-            
+
         segments = [text] if text else []
         lines_info = []
-            
+
         # Calculate mean perplexity
         mean_loss = loss.mean() if len(loss) > 0 else torch.tensor(0.0)
         ppl = torch.exp(mean_loss).item() if mean_loss.item() != float('inf') else float('inf')
-        
+
         result = {
             "loss": loss,
             "input_ids": input_ids,
@@ -412,14 +353,10 @@ class LongCodeZip:
             "segments": segments,
             "ppl": ppl,
         }
-        
+
         if return_kv:
             result["past_key_values"] = outputs.past_key_values
-        else:
-            # Cache the result if we're not returning KV cache
-            self.cache["perplexity"][cache_key] = result
-            self._manage_cache_size("perplexity")
-            
+
         return result
     
     def __get_lines_info(self, lines, input_ids, loss):
@@ -502,51 +439,39 @@ class LongCodeZip:
         """
         Calculate perplexity change of a question when given context text.
         A positive change means the context helps reduce question perplexity.
-        
+
         Args:
             text: The context text
             question: The question to evaluate
             condition_in_question: Conditioning mode (none, prefix)
             granularity: Granularity for perplexity calculation
-            
+
         Returns:
             Perplexity change for the question with/without context
         """
-        # Create a cache key for this conditional perplexity calculation
-        cache_key = f"{text}_{question}_{condition_in_question}_{granularity}"
-        
-        if cache_key in self.cache["conditional_ppl"]:
-            return self.cache["conditional_ppl"][cache_key]
-        
         if condition_in_question == "none":
             # Just return the perplexity of the text
             result = self.get_ppl(
                 text=text, granularity=granularity, condition_mode="none"
             )
-            ppl_value = result["ppl"]
+            return result["ppl"]
         else:
             # First calculate question perplexity without context
             question_ppl_without_context = self.get_ppl(
-                text=question, 
+                text=question,
                 granularity=granularity
             )["ppl"]
-            
+
             # Then calculate question perplexity with context
             question_ppl_with_context = self.get_ppl(
-                text=text + "\n\n" + question, 
+                text=text + "\n\n" + question,
                 granularity=granularity,
                 condition_mode="prefix",
                 condition_pos_id=self.get_token_length(text + "\n\n", add_special_tokens=True)
             )["ppl"]
-            
+
             # Calculate the change (positive means context helps)
-            ppl_value = question_ppl_without_context - question_ppl_with_context
-        
-        # Cache the result
-        self.cache["conditional_ppl"][cache_key] = ppl_value
-        self._manage_cache_size("conditional_ppl")
-        
-        return ppl_value
+            return question_ppl_without_context - question_ppl_with_context
        
     def control_context_budget(
         self,
@@ -616,8 +541,8 @@ class LongCodeZip:
             # Without question, use default ordering
             demonstrations_sort = [(i, 0) for i in range(len(context_list))]
         
-        # Extract ranking for later use
-        self.context_idxs.append([x for idx, (x, _) in enumerate(demonstrations_sort)])
+        # Extract ranking for later use (return value only, don't store)
+        context_ranking = [x for idx, (x, _) in enumerate(demonstrations_sort)]
         
         # Calculate the target token budget with context_budget expression
         if target_token < 0:
