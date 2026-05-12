@@ -13,7 +13,9 @@ def generate_completion(
     generation_model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
     max_new_tokens: int = 32,
     use_openai: bool = False,
-    api_key: str = None
+    api_key: str = None,
+    hf_model=None,
+    hf_tokenizer=None,
 ):
 
     if use_openai:
@@ -46,24 +48,25 @@ def generate_completion(
             generated = generated.strip()
 
     else:
-        tokenizer = AutoTokenizer.from_pretrained(generation_model)
-        model = AutoModelForCausalLM.from_pretrained(
-            generation_model,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-        tokenized = tokenizer(prompt, return_tensors="pt").to(model.device)
-        output_ids = model.generate(
-            **tokenized,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.eos_token_id
-        )
+        # Reuse a single preloaded HF model/tokenizer to avoid loading the
+        # weights into VRAM on every call (which otherwise leaks GPU memory).
+        if hf_model is None or hf_tokenizer is None:
+            raise ValueError(
+                "hf_model and hf_tokenizer must be provided when use_openai=False"
+            )
+        tokenized = hf_tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+        with torch.inference_mode():
+            output_ids = hf_model.generate(
+                **tokenized,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=hf_tokenizer.eos_token_id
+            )
 
-        generated = tokenizer.decode(
+        generated = hf_tokenizer.decode(
             output_ids[0][len(tokenized.input_ids[0]):],
             skip_special_tokens=True
         ).strip()
-    
+
     return generated.split("\n\n")[0].strip()
 
 
@@ -98,6 +101,19 @@ if __name__ == "__main__":
     logger.info("Initializing compressor...")
     compression_model_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
     compressor = LongCodeZip(model_name=compression_model_name)
+
+    # Preload the generation model once (HF path only) to avoid reloading
+    # weights on every generate_completion call.
+    hf_model = None
+    hf_tokenizer = None
+    if not args.use_openai:
+        hf_tokenizer = AutoTokenizer.from_pretrained(args.generation_model)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.generation_model,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        hf_model.eval()
     
     # Test function-based code file compression with query
     logger.info("\nTesting function-based code file compression with query...")
@@ -118,7 +134,7 @@ if __name__ == "__main__":
     logger.info(f"Compressed prompt: \n{result_cond['compressed_prompt']}")
     logger.info(f"Compression ratio: {result_cond['compression_ratio']:.4f}") # Compression ratio: 0.3856
 
-    completion = generate_completion(prompt=result_cond["compressed_prompt"], generation_model=args.generation_model, use_openai=args.use_openai)
+    completion = generate_completion(prompt=result_cond["compressed_prompt"], generation_model=args.generation_model, use_openai=args.use_openai, hf_model=hf_model, hf_tokenizer=hf_tokenizer)
     logger.info(f"Completion: {completion}")
 
 
@@ -133,5 +149,5 @@ if __name__ == "__main__":
     logger.info(f"Compressed prompt: \n{result_cond['compressed_prompt']}")
     logger.info(f"Compression ratio: {result_cond['compression_ratio']:.4f}") # Compression ratio: 0.1468
 
-    completion = generate_completion(prompt=result_cond["compressed_prompt"], generation_model=args.generation_model, use_openai=args.use_openai)
+    completion = generate_completion(prompt=result_cond["compressed_prompt"], generation_model=args.generation_model, use_openai=args.use_openai, hf_model=hf_model, hf_tokenizer=hf_tokenizer)
     logger.info(f"Completion: {completion}")

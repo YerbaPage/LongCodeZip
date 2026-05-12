@@ -170,12 +170,13 @@ def chunk_sliding_window(code: str, window_size: int, overlap: int) -> list[str]
 def compute_embedding(text: str, model, tokenizer, device) -> torch.Tensor:
     """Computes sentence embedding for a text using the provided model."""
     if not text.strip():  # Handle empty strings
-        return torch.zeros(model.config.hidden_size).to(device)
+        return torch.zeros(model.config.hidden_size)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-    # Mean pool the last hidden state
-    embedding = outputs.last_hidden_state.mean(dim=1).squeeze()
+    # Mean pool the last hidden state; move to CPU so callers can accumulate
+    # many embeddings in a list without pinning GPU memory.
+    embedding = outputs.last_hidden_state.mean(dim=1).squeeze().detach().cpu()
     return embedding
 
 # Helper function for RAG retrieval

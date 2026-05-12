@@ -251,6 +251,7 @@ class CodeCompressor:
             model_kwargs[k] = v
         
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
@@ -338,21 +339,21 @@ class CodeCompressor:
             encoding_key = text
             if encoding_key in self.cache["encodings"]:
                 cached_encoding = self.cache["encodings"][encoding_key]
-                input_ids = cached_encoding["input_ids"]
-                attention_mask = cached_encoding["attention_mask"]
+                input_ids = cached_encoding["input_ids"].to(self.model.device)
+                attention_mask = cached_encoding["attention_mask"].to(self.model.device)
             else:
                 encoding = self.tokenizer(
-                    text, 
-                    return_tensors="pt", 
+                    text,
+                    return_tensors="pt",
                     padding=True
                 )
                 input_ids = encoding["input_ids"].to(self.model.device)
                 attention_mask = encoding["attention_mask"].to(self.model.device)
-                
-                # Cache the encoding
+
+                # Cache CPU copies; .to(device) on retrieval to avoid GPU residency
                 self.cache["encodings"][encoding_key] = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask
+                    "input_ids": encoding["input_ids"],
+                    "attention_mask": encoding["attention_mask"]
                 }
                 self._manage_cache_size("encodings")
         
@@ -371,7 +372,7 @@ class CodeCompressor:
                 attention_mask=attention_mask[:, :end],
                 past_key_values=past_key_values,
                 return_dict=True,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 use_cache=True,
             )
         
@@ -411,10 +412,15 @@ class CodeCompressor:
         if return_kv:
             result["past_key_values"] = outputs.past_key_values
         else:
-            # Cache the result if we're not returning KV cache
-            self.cache["perplexity"][cache_key] = result
+            # Cache the result if we're not returning KV cache.
+            # Detach tensors to CPU to avoid pinning GPU memory in the cache.
+            cached_result = {
+                k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                for k, v in result.items()
+            }
+            self.cache["perplexity"][cache_key] = cached_result
             self._manage_cache_size("perplexity")
-            
+
         return result
     
     def __get_lines_info(self, lines, input_ids, loss):

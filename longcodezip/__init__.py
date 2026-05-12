@@ -24,6 +24,7 @@ class EntropyChunking:
         self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+        self.model.eval()
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -243,6 +244,7 @@ class LongCodeZip:
             model_kwargs[k] = v
         
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
@@ -317,7 +319,7 @@ class LongCodeZip:
                 attention_mask=attention_mask[:, :end],
                 past_key_values=past_key_values,
                 return_dict=True,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 use_cache=True,
             )
 
@@ -1055,6 +1057,8 @@ class LongCodeZip:
 
                                     block_importances.append(importance)
                                     pbar.set_description(f"Block {block_idx}: {importance:.2f}")
+                                    if torch.cuda.is_available() and (block_idx + 1) % 50 == 0:
+                                        torch.cuda.empty_cache()
 
                         else:
                             raise ValueError(f"Unsupported fine_grained_importance_method: {fine_grained_importance_method}")
@@ -1589,6 +1593,8 @@ class LongCodeZip:
 
                 line_scores.append(importance)
                 scored_indices.append(i)
+                if torch.cuda.is_available() and (i + 1) % 50 == 0:
+                    torch.cuda.empty_cache()
                 # Update tqdm description if needed, e.g., with last score
                 # pbar.set_description(f"Contrastive PPL (L{i}: {importance:.2f})")
 
